@@ -170,14 +170,79 @@ for each public company. Grading uses a private set of about 20 unseen
 companies with the same tools and the same answer key rules, but different
 names and wording, and scores your 3 points only.
 
-## Homework 3 solution:
-> to students: this is your report, see the homework description.
+## Homework 3 solution
 
 ### My 3 points and rules
-> for each point: why you chose it, your PASS rule in one or two sentences, and the evidence it uses. Quote Fisher where it helps.
+
+I selected points **1, 5, and 6** because their evidence can be calculated directly and reproducibly from the database. This avoids asking a language model to perform arithmetic or infer a numerical threshold from prose. The thresholds come from each company's own industry median rather than from company names or public-test labels.
+
+#### Point 1 — Market potential for sales growth
+
+Fisher asks whether a company's products or services have "sufficient market potential" for a sizable increase in sales over several years. I chose this point because sustained historical sales growth, compared with the relevant industry, is direct evidence of market potential.
+
+**PASS rule:** Calculate `(FY2025 revenue / FY2023 revenue - 1) × 100`, where annual revenue is the sum of `orders.amount`. The company passes if its two-year growth is greater than or equal to `industry_medians.revenue_growth_2y_pct` for its own industry; otherwise it fails.
+
+**Evidence:** `orders`, `company`, and `industry_medians`, accessed only through `sql_query`.
+
+#### Point 5 — Worthwhile profit margin
+
+Fisher's "worthwhile profit margin" should be assessed in industry context because normal margins differ between industries. I selected this point because the database supplies both the required annual accounts and an industry benchmark.
+
+**PASS rule:** Calculate FY2025 operating margin as `(revenue - cost of sales - selling and admin - R&D) / revenue × 100`. The company passes if this margin is greater than or equal to `industry_medians.operating_margin_pct` for its industry; otherwise it fails.
+
+**Evidence:** FY2025 `orders` and `monthly_costs`, plus `company` and `industry_medians`, accessed only through `sql_query`.
+
+#### Point 6 — Maintaining or improving margins
+
+A single strong year does not show whether profitability is being sustained. I chose this point because it adds a time-series test to point 5: a company can have an above-median margin while still deteriorating.
+
+**PASS rule:** Calculate FY2024 and FY2025 operating margins using the same formula as point 5. The company passes if `FY2025 margin - FY2024 margin >= 0` percentage points, meaning that the margin was maintained or improved; otherwise it fails.
+
+**Evidence:** FY2024 and FY2025 `orders` and `monthly_costs`, accessed only through `sql_query`.
 
 ### Design
-> a visualization of your agent design and one paragraph describing it.
+
+```mermaid
+flowchart TD
+    A[Company-specific LangChain tools] --> B[sql_query: one aggregate SELECT]
+    B --> C[Python: annual revenue, growth and operating margins]
+    C --> D1[Point 1: two-year growth versus industry median]
+    C --> D2[Point 5: FY2025 margin versus industry median]
+    C --> D3[Point 6: FY2025 margin versus FY2024 margin]
+    D1 --> E[Fixed PASS/FAIL verdict dictionary]
+    D2 --> E
+    D3 --> E
+    E --> F[DeepSeek deepseek-v4-flash: concise evidence summary only]
+    E --> G[Deterministic fallback summary]
+    F --> H[results.csv]
+    G --> H
+```
+
+For each company, the agent calls the supplied `sql_query` tool once with an aggregate query that returns one row containing FY2023-FY2025 revenue, FY2024-FY2025 costs, and the two industry medians. Python performs every ratio and comparison and creates the verdicts. The LangChain `ChatDeepSeek` model then receives only rounded metrics and fixed verdicts and is instructed to rewrite them as a short summary, never to recalculate or reverse a decision. A completeness validator rejects empty, truncated, implausibly precise, or verdict-inconsistent model text. If no API key is configured, the model returns no usable text, or validation fails, the program uses an equivalent deterministic summary so the evidence pipeline and verdicts still complete. Exceptions are isolated per company.
+
+This design deliberately separates **evidence and calculation** from **language generation**. It prevents arithmetic hallucinations and summary wording from affecting the balanced accuracy, while still using the required DeepSeek model through LangChain. It uses no interviews and does not open `company.db`, `interviews.dat`, or document files directly.
 
 ### Results
-> your point score on `public_test`, the companies where your verdicts disagree with the public answers, and why.
+
+The submitted program was run with:
+
+```bash
+python3 hw3.py --data-folder public_test
+```
+
+| Measure | Result |
+| --- | ---: |
+| Companies processed | 20/20 |
+| Individual verdicts correct | **60/60** |
+| True-PASS recall | **42/42 = 100%** |
+| True-FAIL recall | **18/18 = 100%** |
+| Balanced point score | **100.0%** |
+| Interviews used | 0 per company |
+
+The complete output is in `results.csv`. The latest end-to-end run with the configured DeepSeek API completed successfully in **97.03 seconds**, processing 20/20 companies and scoring 60/60 (balanced 100.0%). Of the 20 summaries, 16 passed the completeness validator as model-generated text and 4 empty or truncated responses were safely replaced by deterministic summaries. The deterministic evidence and verdict pipeline was run three times and returned the same 60/60 result each time. When a valid DeepSeek key is present, the model can change only summary wording; it cannot change the verdicts.
+
+#### Disagreements with the public answers
+
+**None.** Every predicted verdict for points 1, 5, and 6 agrees with `public_test/ground_truth.json`, so there are no company-level disagreements to list.
+
+The rules were not fitted with company-specific thresholds or hard-coded public answers. Each comparison uses a company's industry median or its own prior-year margin. This makes the logic applicable to unseen companies with different names and industries. Private-set performance still depends on the unpublished answer-key definitions and data, so the public score is evidence of consistency rather than a guarantee of a future score.

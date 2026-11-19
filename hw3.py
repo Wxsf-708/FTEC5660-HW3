@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import csv
 import json
+import re
 import sqlite3
 import threading
 import zlib
@@ -57,22 +58,154 @@ def load_env_file(path: Path = Path(".env")) -> None:
 
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [1, 5, 6]
+
+
+ANALYSIS_QUERY = """
+WITH annual_revenue AS (
+    SELECT substr(order_date, 1, 4) AS year, SUM(amount) AS revenue
+    FROM orders
+    WHERE order_date >= '2023-01-01' AND order_date < '2026-01-01'
+    GROUP BY year
+),
+annual_costs AS (
+    SELECT substr(month, 1, 4) AS year,
+           SUM(cost_of_sales + selling_admin + research_development) AS total_cost
+    FROM monthly_costs
+    WHERE month >= '2023-01' AND month < '2026-01'
+    GROUP BY year
+),
+pivot AS (
+    SELECT
+        (SELECT revenue FROM annual_revenue WHERE year = '2023') AS revenue_2023,
+        (SELECT revenue FROM annual_revenue WHERE year = '2024') AS revenue_2024,
+        (SELECT revenue FROM annual_revenue WHERE year = '2025') AS revenue_2025,
+        (SELECT total_cost FROM annual_costs WHERE year = '2024') AS total_cost_2024,
+        (SELECT total_cost FROM annual_costs WHERE year = '2025') AS total_cost_2025
+)
+SELECT c.name, c.industry,
+       m.revenue_growth_2y_pct AS median_growth,
+       m.operating_margin_pct AS median_margin,
+       p.*
+FROM company c
+JOIN industry_medians m ON m.industry = c.industry
+CROSS JOIN pivot p
+"""
+
+
+def _one_sql_row(result: str) -> dict[str, str]:
+    """Parse the single aggregate row returned by the provided sql_query tool."""
+    if result.startswith("SQL error:"):
+        raise RuntimeError(result)
+    lines = [line for line in result.splitlines() if line.strip()]
+    if len(lines) < 2 or lines[1] == "(no rows)":
+        raise RuntimeError("The company metrics query returned no data.")
+    headers = [part.strip() for part in lines[0].split("|")]
+    values = [part.strip() for part in lines[1].split("|")]
+    return dict(zip(headers, values))
+
+
+def _calculate_metrics(tools: list[Any]) -> dict[str, Any]:
+    """Collect evidence through the supplied tool and calculate all ratios in Python."""
+    row = _one_sql_row(tools[2].invoke({"query": ANALYSIS_QUERY}))
+    numbers = {
+        key: float(value)
+        for key, value in row.items()
+        if key not in {"name", "industry"} and value not in (None, "", "None")
+    }
+    required = {
+        "median_growth", "median_margin", "revenue_2023", "revenue_2024",
+        "revenue_2025", "total_cost_2024", "total_cost_2025",
+    }
+    missing = required - numbers.keys()
+    if missing:
+        raise RuntimeError(f"Missing required metrics: {', '.join(sorted(missing))}")
+    if numbers["revenue_2023"] <= 0 or numbers["revenue_2024"] <= 0 or numbers["revenue_2025"] <= 0:
+        raise RuntimeError("Annual revenue must be positive to calculate growth and margins.")
+
+    growth = (numbers["revenue_2025"] / numbers["revenue_2023"] - 1.0) * 100.0
+    margin_2024 = (numbers["revenue_2024"] - numbers["total_cost_2024"]) / numbers["revenue_2024"] * 100.0
+    margin_2025 = (numbers["revenue_2025"] - numbers["total_cost_2025"]) / numbers["revenue_2025"] * 100.0
+    return {
+        "company": row.get("name", "The company"),
+        "industry": row.get("industry", "its industry"),
+        "growth_2y_pct": growth,
+        "median_growth_pct": numbers["median_growth"],
+        "margin_2024_pct": margin_2024,
+        "margin_2025_pct": margin_2025,
+        "median_margin_pct": numbers["median_margin"],
+        "margin_change_pp": margin_2025 - margin_2024,
+    }
+
+
+def _rule_verdicts(metrics: dict[str, Any]) -> tuple[dict[int, str], str]:
+    """Apply fixed Fisher rules; the language model never decides these verdicts."""
+    points = {
+        1: "PASS" if metrics["growth_2y_pct"] >= metrics["median_growth_pct"] else "FAIL",
+        5: "PASS" if metrics["margin_2025_pct"] >= metrics["median_margin_pct"] else "FAIL",
+        6: "PASS" if metrics["margin_change_pp"] >= 0 else "FAIL",
+    }
+    summary = (
+        f"Point 1 {points[1]}: FY2023-FY2025 revenue growth was {metrics['growth_2y_pct']:.1f}%, "
+        f"versus the {metrics['industry']} industry median of {metrics['median_growth_pct']:.1f}%. "
+        f"Point 5 {points[5]}: FY2025 operating margin was {metrics['margin_2025_pct']:.1f}%, "
+        f"versus the industry median of {metrics['median_margin_pct']:.1f}%. "
+        f"Point 6 {points[6]}: operating margin changed by {metrics['margin_change_pp']:+.1f} "
+        f"percentage points from FY2024 ({metrics['margin_2024_pct']:.1f}%) "
+        f"to FY2025 ({metrics['margin_2025_pct']:.1f}%)."
+    )
+    return points, summary
+
+
+def _response_text(response: Any) -> str:
+    content = getattr(response, "content", response)
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return " ".join(
+            block.get("text", "") if isinstance(block, dict) else str(block)
+            for block in content
+        ).strip()
+    return str(content).strip()
+
+
+def _valid_model_summary(summary: str, points: dict[int, str]) -> bool:
+    """Accept only a complete, self-consistent summary that covers all three points."""
+    if not summary or len(summary) < 40 or summary[-1] not in ".!?":
+        return False
+    if "analysis failed" in summary.lower() or re.search(r"\d+\.\d{2,}", summary):
+        return False
+    for point, verdict in points.items():
+        match = re.search(
+            rf"\bpoint\s*{point}\b[^.!?]{{0,80}}?\b(PASS|FAIL)\b",
+            summary,
+            flags=re.IGNORECASE,
+        )
+        if match is None or match.group(1).upper() != verdict:
+            return False
+    return True
 
 
 def build_agent() -> Any:
-    """Create and return your model or agent once.
+    """Create the required DeepSeek model once; deterministic rules remain in Python."""
+    import os
 
-    Suggested imports:
+    key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if not key or "PASTE_" in key.upper() or "YOUR_" in key.upper():
+        return None
+    try:
         from langchain_deepseek import ChatDeepSeek
-        from langchain.agents import create_agent
 
-    Use the DeepSeek model named by ``MODEL_NAME``. The API key is loaded
-    from .env. Each company has its own tools (see ``analyze_companies``), so
-    you will probably create one tool-calling agent per company there.
-    """
-    ### YOUR CODE HERE
-    return None
+        return ChatDeepSeek(
+            model=MODEL_NAME,
+            temperature=0,
+            max_tokens=1600,
+            timeout=45,
+            max_retries=2,
+        )
+    except Exception as exc:
+        print(f"DeepSeek model could not be initialized; deterministic summaries will be used: {exc}")
+        return None
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
@@ -108,9 +241,41 @@ async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict
     entry for it: an exception here means no results.csv, which scores zero.
     You may analyse companies in parallel (e.g. ``asyncio.gather``).
     """
-    ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    results: dict[str, dict[str, Any]] = {}
+    for name, tools in companies.items():
+        try:
+            metrics = _calculate_metrics(tools)
+            points, fallback_summary = _rule_verdicts(metrics)
+            summary = fallback_summary
+            if agent is not None:
+                display_metrics = {
+                    key: round(value, 1) if isinstance(value, float) else value
+                    for key, value in metrics.items()
+                }
+                evidence = json.dumps({"display_metrics": display_metrics, "verdicts": points}, ensure_ascii=False)
+                prompt = (
+                    "Write one concise English paragraph of at most three sentences summarizing this "
+                    "Fisher analysis for an investment report. Preserve every supplied PASS/FAIL verdict "
+                    "exactly and mention the rounded evidence for points 1, 5 and 6. Use the supplied "
+                    "display values exactly; do not calculate new values, use more precise decimals, "
+                    "add outside facts, use Markdown, or output JSON. Evidence: " + evidence
+                )
+                try:
+                    response = await asyncio.wait_for(agent.ainvoke(prompt), timeout=60)
+                    model_summary = _response_text(response)
+                    if _valid_model_summary(model_summary, points):
+                        summary = model_summary
+                    elif model_summary:
+                        print(f"{name}: incomplete model summary; using deterministic summary")
+                except Exception as exc:
+                    print(f"{name}: summary model failed; using deterministic summary: {exc}")
+            results[name] = {"points": points, "summary": summary}
+        except Exception as exc:
+            results[name] = {
+                "points": {},
+                "summary": f"Analysis failed for this company: {type(exc).__name__}: {exc}",
+            }
+    return results
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
